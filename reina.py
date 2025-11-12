@@ -108,11 +108,17 @@ async def run_worker(worker_id: int, browser, lock: asyncio.Lock, url_a_visitar:
                 print(f"[ERROR] {log_id} Clic (Participante): {e}")
                 continue
 
-            
-            # --- 8. CLIC ENVIAR ---
+
+            # --- 8. CLIC ENVIAR (MODIFICADO A XPATH) ---
             try:
-                print(f"{log_id} Buscando 'Enviar'...")
-                enviar_locator = page.get_by_text("Enviar", exact=True).first
+                # Este es el XPath que proporcionaste para el botón de enviar
+                selector_enviar_xpath = "/html/body/div/div[2]/form/div[2]/div/div[3]/div/div[1]/div/span/span"
+                
+                print(f"{log_id} Buscando 'Enviar' (con XPath)...")
+                
+                # Usamos el localizador de XPath en lugar de page.get_by_text()
+                enviar_locator = page.locator(f"xpath={selector_enviar_xpath}").first
+                
                 await enviar_locator.click(timeout=5000)
                 print(f"{log_id} ¡Clic (Enviar) OK!")
                 
@@ -120,7 +126,8 @@ async def run_worker(worker_id: int, browser, lock: asyncio.Lock, url_a_visitar:
                 await log_success(log_id, lock)
 
             except PlaywrightTimeoutError:
-                print(f"[ERROR] {log_id} No se encontró 'Enviar' después de 5s.")
+                # Actualicé el mensaje de error para reflejar el cambio
+                print(f"[ERROR] {log_id} No se encontró 'Enviar' (XPath) después de 5s.")
             except Exception as e:
                 print(f"[ERROR] {log_id} Clic (Enviar): {e}")
 
