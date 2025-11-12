@@ -164,7 +164,7 @@ async def main():
     
     # --- ¡CAMBIA ESTE NÚMERO! ---
     # Define cuántos navegadores paralelos quieres ejecutar
-    NUM_PARALLEL_SESSIONS = 1
+    NUM_PARALLEL_SESSIONS = 4
     # -----------------------------
 
     url_a_visitar = "https://docs.google.com/forms/d/e/1FAIpQLSfwaXdc-S_BBC3f6zQGZsl9B5845j6ef7nCT4MXMmLbsDYYkw/viewform"
@@ -210,3 +210,4 @@ async def main():
 if __name__ == "__main__":
     # asyncio.run() se encarga de iniciar y cerrar el bucle de eventos
     asyncio.run(main())
+
