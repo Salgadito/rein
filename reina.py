@@ -1,214 +1,355 @@
-import asyncio
-import re
-# --- MODIFICADO: Importar 'TimeoutError' y renombrarlo a 'PlaywrightTimeoutError' ---
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Route
-# --- NUEVOS IMPORTS ---
-from datetime import datetime
+from playwright.sync_api import sync_playwright, expect
+import time
 import random
-import os
+import string
+import threading
+import logging  # <--- NUEVO: Sistema de logging
+import sys      # <--- NUEVO: Para enviar logs a la consola
 
-# --- Lista de dominios para bloquear (ejemplo) ---
-# ... (lista sin cambios) ...
-BLOCK_LIST = [
-    "doubleclick.net",
-    "google-analytics.com",
-    "googletagservices.com",
-    "googlesyndication.com",
-    "adservice.google.com",
-    "z.moatads.com",
-    "pagead2.googlesyndication.com",
+# --- INICIO DE CONFIGURACIÓN ---
+NOMBRES = [
+    'Juan', 'Carlos', 'Ana', 'Maria', 'Luis', 'Jose', 'Sofia', 'Camila', 'Andres', 
+    'Alejandro', 'Valentina', 'Isabella', 'David', 'Santiago', 'Laura', 'Daniela'
 ]
+APELLIDOS = [
+    'Garcia', 'Rodriguez', 'Martinez', 'Hernandez', 'Lopez', 'Gonzalez', 'Perez',
+    'Sanchez', 'Ramirez', 'Torres', 'Gomez', 'Diaz', 'Vasquez', 'Castro', 'Suarez'
+]
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/119.0"
+]
+# --- Fin de Configuración ---
 
-# --- NUEVA CONSTANTE ---
-# Define el nombre del archivo de log
-LOG_FILE = "success_log.txt"
+
+# --- (NUEVO) Constante para número de workers ---
+NUM_WORKERS = 5 
+
+# --- (NUEVO) Contadores globales y Lock para thread-safety ---
+total_cycles_ok = 0
+total_cycles_fail = 0
+total_votes_ok = 0
+counter_lock = threading.Lock()
+
+# --- (NUEVO) Función para configurar el logging ---
+def setup_logging():
+    """Configura el logger para que escriba en archivo y consola."""
+    # Formato del log
+    log_formatter = logging.Formatter(
+        '%(asctime)s [%(threadName)-11s] [%(levelname)-5.5s]  %(message)s'
+    )
+    
+    # Logger raíz
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO) # Nivel de log
+
+    # Handler para el archivo 'bot_log.txt'
+    file_handler = logging.FileHandler("bot_log.txt", mode='w')
+    file_handler.setFormatter(log_formatter)
+    root_logger.addHandler(file_handler)
+
+    # Handler para la consola (stdout)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    root_logger.addHandler(console_handler)
 
 
-async def block_ads(route: Route):
-# ... (función sin cambios) ...
-    """
-    Función asíncrona que intercepta las peticiones.
-    Aborta la petición si la URL coincide con la lista de bloqueo.
-    """
+# --- (Función 'block_ads' sin cambios) ---
+def block_ads(route):
+    blocked_domains = [
+        "googlesyndication.com", "googleadservices.com", "googletagmanager.com",
+        "google-analytics.com", "doubleclick.net", "facebook.net",
+        "connect.facebook.net", "adservice.google.com",
+    ]
     url = route.request.url
-    try:
-        if any(domain in url for domain in BLOCK_LIST):
-            # print(f"Bloqueando (async): {url}") # Descomenta para depuración
-            await route.abort()
-        else:
-            await route.continue_()
-    except Exception as e:
-        # Esto puede pasar si la página se cierra mientras la ruta está pendiente
-        # print(f"Error al procesar la ruta {url}: {e}") # Opcional: puede ser muy ruidoso
-        pass # Ignoramos errores si la ruta falla (ej. página cerrándose)
+    if any(domain in url for domain in blocked_domains):
+        try: route.abort()
+        except Exception: pass
+    else:
+        try: route.continue_()
+        except Exception: pass
 
-# --- NUEVA FUNCIÓN DE LOG ---
-async def log_success(log_id: str, lock: asyncio.Lock):
-    """
-    Escribe una entrada de éxito en el archivo de log de forma asíncrona y segura.
-    Usa un Lock para prevenir escrituras concurrentes.
-    """
-    # Obtenemos la fecha y hora actual
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"[{timestamp}] - {log_id} - Voto exitoso.\n"
+# --- (MODIFICADA) Función 'generar_datos_aleatorios' con logging ---
+def generar_datos_aleatorios():
+    logger = logging.getLogger(__name__) # <--- Obtener el logger
+    thread_name = threading.current_thread().name
     
-    # Adquirimos el lock antes de escribir en el archivo
-    async with lock:
-        try:
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(log_entry)
-            print(f"    {log_id} -> ¡Éxito registrado en {LOG_FILE}!")
-        except Exception as e:
-            print(f"[ERROR] {log_id} No se pudo escribir en el log: {e}")
-
-# --- LÓGICA REESTRUCTURADA EN UN "WORKER" ---
-async def run_worker(worker_id: int, browser, lock: asyncio.Lock, url_a_visitar: str):
-    """
-    Un solo "trabajador" que se ejecuta en un bucle infinito.
-    Cada trabajador simula un usuario, creando un nuevo contexto por iteración.
-    """
-    iteration_count = 0
-    while True:
-        iteration_count += 1
-        # log_id dinámico para este worker
-        log_id = f"[Worker {worker_id} | Iter {iteration_count}]"
-        context = None  # Definimos context aquí para el 'finally'
-        
-        try:
-            # --- 3. "Sesión Limpia": Creamos un NUEVO contexto ---
-            print(f"{log_id} Creando nuevo contexto...")
-            context = await browser.new_context()
-            
-            # --- 4. Aplicamos el bloqueo de anuncios AL NUEVO CONTEXTO ---
-            await context.route("**/*", block_ads)
-            
-            # --- 5. Creamos una nueva página en este contexto ---
-            page = await context.new_page()
-            
-            print(f"{log_id} Navegando a: {url_a_visitar}")
-            
-            # --- 6. GOTO ---
-            await page.goto(url_a_visitar, timeout=60000)
-            page_title = await page.title()
-            print(f"{log_id} Página cargada. Título: {page_title}")
-
-            # --- 7. CLIC PARTICIPANTE (XPath) ---
-            try:
-                selector_xpath = "/html/body/div/div[2]/form/div[2]/div/div[2]/div/div/div/div[2]/div/div/span/div/div[25]/label/div[2]/div[1]/div"
-                print(f"{log_id} Buscando (XPath)...")
-                element_locator = page.locator(f"xpath={selector_xpath}").first
-                await element_locator.click(timeout=10000)
-                print(f"{log_id} ¡Clic (Participante) OK!")
-
-            except PlaywrightTimeoutError:
-                print(f"[ERROR] {log_id} No se encontró (Participante) después de 10s.")
-                # Si esto falla, saltamos el resto de la iteración
-                continue 
-            except Exception as e:
-                print(f"[ERROR] {log_id} Clic (Participante): {e}")
-                continue
-
-
-            # --- 8. CLIC ENVIAR (MODIFICADO A XPATH) ---
-            try:
-                # Este es el XPath que proporcionaste para el botón de enviar
-                selector_enviar_xpath = "/html/body/div/div[2]/form/div[2]/div/div[3]/div/div[1]/div/span/span"
-                
-                print(f"{log_id} Buscando 'Enviar' (con XPath)...")
-                
-                # Usamos el localizador de XPath en lugar de page.get_by_text()
-                enviar_locator = page.locator(f"xpath={selector_enviar_xpath}").first
-                
-                await enviar_locator.click(timeout=5000)
-                print(f"{log_id} ¡Clic (Enviar) OK!")
-                
-                # --- ¡ÉXITO! Registramos en el log ---
-                await log_success(log_id, lock)
-
-            except PlaywrightTimeoutError:
-                # Actualicé el mensaje de error para reflejar el cambio
-                print(f"[ERROR] {log_id} No se encontró 'Enviar' (XPath) después de 5s.")
-            except Exception as e:
-                print(f"[ERROR] {log_id} Clic (Enviar): {e}")
-
-
-            # --- 9. Pausa corta y aleatoria ---
-            # Espera entre 3 y 7 segundos para no sobrecargar
-            sleep_time = random.uniform(0.5, 2)
-            print(f"{log_id} Iteración completada. Esperando {sleep_time:.1f}s...")
-            await asyncio.sleep(sleep_time)
-
-        except PlaywrightTimeoutError:
-            print(f"[ERROR] {log_id} Timeout: No se pudo cargar la página en 60s.")
-        except Exception as e:
-            print(f"[ERROR] {log_id} Ocurrió un error inesperado: {e}")
-        finally:
-            # --- 10. Limpieza de la iteración ---
-            if context:
-                # print(f"{log_id} Cerrando contexto.") # Descomentar para depuración
-                await context.close()
-        
-        # Pequeña pausa para evitar que un worker fallido sature la consola
-        if "ERROR" in log_id:
-             await asyncio.sleep(5)
-
-
-async def main():
-    """
-    Función principal asíncrona.
-    --- MODIFICADO ---
-    Lanza el navegador una vez.
-    Lanza N 'workers' paralelos (definidos en NUM_PARALLEL_SESSIONS).
-    Usa asyncio.gather para ejecutarlos todos concurrentemente.
-    """
+    # 1. Generar Nombre y Apellido
+    nombre = random.choice(NOMBRES)
+    apellido = random.choice(APELLIDOS)
     
-    # --- ¡CAMBIA ESTE NÚMERO! ---
-    # Define cuántos navegadores paralelos quieres ejecutar
-    NUM_PARALLEL_SESSIONS = 6
-    # -----------------------------
+    # 2. Generar Contraseña
+    letras_mayusculas = string.ascii_uppercase
+    letras_minusculas = string.ascii_lowercase
+    digitos = string.digits
+    caracteres_especiales = '@$!%*?&'
+    password_lista = [
+        random.choice(letras_mayusculas), random.choice(letras_minusculas),
+        random.choice(digitos), random.choice(caracteres_especiales)
+    ]
+    todos_los_caracteres = letras_mayusculas + letras_minusculas + digitos + caracteres_especiales
+    for _ in range(4): 
+        password_lista.append(random.choice(todos_los_caracteres))
+    random.shuffle(password_lista)
+    password = ''.join(password_lista)
 
-    url_a_visitar = "https://docs.google.com/forms/d/e/1FAIpQLSfwaXdc-S_BBC3f6zQGZsl9B5845j6ef7nCT4MXMmLbsDYYkw/viewform"
-    print(f"[INFO] Iniciando el script con {NUM_PARALLEL_SESSIONS} workers paralelos.")
+    # 3. Generar Teléfono Aleatorio
+    prefijos_validos = [str(p) for p in range(310, 322)] 
+    prefijo = random.choice(prefijos_validos)
+    sufijo = f"{random.randint(0, 9999999):07d}" 
+    telefono = prefijo + sufijo
+            
+    datos = {
+        "nombre": nombre, "apellido": apellido,
+        "telefono": telefono, "password": password,
+    }
+    
+    # <--- Reemplazamos print por logger.info
+    logger.info(f"[{thread_name}] [Datos Generados] Usando: {nombre} {apellido}, Tel: {telefono}, Pass: {password}")
+    return datos
 
-    # Creamos un Lock para pasarlo a los workers (para el log)
-    lock = asyncio.Lock()
+# --- (MODIFICADA) Función 'run' con logging y conteo ---
+def run():
+    logger = logging.getLogger(__name__) # <--- Obtener el logger
+    thread_name = threading.current_thread().name
+    
+    logger.info(f"[{thread_name}] --- INICIANDO NUEVO CICLO DE REGISTRO Y VOTO ---")
+    
+    # Variables de estado para este ciclo
+    votes_in_this_cycle = 0
+    cycle_succeeded = False
 
-    async with async_playwright() as playwright:
-        # --- 1. Lanzamos el navegador UNA SOLA VEZ ---
-        print("[INFO] Lanzando el navegador (visible)...")
-        browser = await playwright.chromium.launch(headless=True)
+    with sync_playwright() as playwright:
+        browser = None 
         
-        # --- 2. Creamos la lista de tareas (workers) ---
-        tasks = []
-        for i in range(1, NUM_PARALLEL_SESSIONS + 1):
-            tasks.append(
-                run_worker(
-                    worker_id=i, 
-                    browser=browser, 
-                    lock=lock, 
-                    url_a_visitar=url_a_visitar
-                )
-            )
+        datos = generar_datos_aleatorios()
+        user_agent = random.choice(USER_AGENTS)
+        
+        logger.info(f"[{thread_name}] [User-Agent] Usando: {user_agent[:50]}...")
         
         try:
-            # --- 3. Ejecutamos todas las tareas en paralelo ---
-            print(f"[INFO] Lanzando {len(tasks)} workers. Presiona Ctrl+C para detener.")
-            await asyncio.gather(*tasks)
-        
-        except KeyboardInterrupt:
-            # Permite detener el bucle con Ctrl+C en la terminal
-            print("\n[INFO] Deteniendo workers (Ctrl+C)...")
-        
-        finally:
-            # --- 4. Limpieza final ---
-            print("[INFO] Cerrando el navegador.")
-            await browser.close()
-            print("[INFO] Script finalizado.")
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(user_agent=user_agent)
+            context.route("**/*", block_ads)
+            
+            page = context.new_page() 
+            page_tempmail = None 
+            url = "https://vota.reto3x.com.co/participantes/marlon-"
 
-# --- Punto de entrada estándar para scripts asíncronos ---
-# ... (sin cambios) ...
+            # --- (Todos los 'print' se reemplazan por 'logger.info') ---
+            logger.info(f"[{thread_name}] Navegando a {url}...")
+            page.goto(url)
+            
+            logger.info(f"[{thread_name}] Haciendo clic en 'Votar'...")
+            page.get_by_label("Votar").click()
+
+            logger.info(f"[{thread_name}] Haciendo clic en 'Confirmar'...")
+            page.get_by_role("button", name="Confirmar").click()
+
+            logger.info(f"[{thread_name}] Haciendo clic en 'Registrarse'...")
+            page.get_by_role("link", name="Registrarse").click()
+            
+            # --- LÓGICA DE EMAIL TEMPORAL ---
+            try:
+                logger.info(f"[{thread_name}] Abriendo https://mail.tm/es/...")
+                page_tempmail = context.new_page()
+                page_tempmail.goto("https://mail.tm/es/")
+
+                logger.info(f"[{thread_name}] Esperando que se genere el email temporal...")
+                email_selector = "#Dont_use_WEB_use_API_OK"
+                email_input_element = page_tempmail.locator(email_selector)
+                email_input_element.wait_for(state="visible", timeout=10000)
+                expect(email_input_element).not_to_have_value("...", timeout=20000)
+                
+                email = email_input_element.input_value()
+                if not email or email == "...":
+                    raise Exception("Email temporal no se pudo generar.")
+                logger.info(f"[{thread_name}] Email temporal obtenido: {email}")
+
+            except Exception as e:
+                logger.error(f"[{thread_name}] Error esperando email: {e}")
+
+
+            # --- RELLENADO DE FORMULARIO ---
+            page.bring_to_front()
+            logger.info(f"[{thread_name}] Rellenando el correo electrónico...")
+            page.locator("#email").fill(email) 
+            
+            xpath_1 = "/html/body/main/div/div/div/div/div[1]/form/div[2]/div[1]/label/span"
+            page.locator(f"xpath={xpath_1}").click()
+            xpath_2 = "/html/body/main/div/div/div/div/div[1]/form/div[3]/div[1]/label/span"
+            page.locator(f"xpath={xpath_2}").click()
+            
+            logger.info(f"[{thread_name}] Haciendo clic en 'Continuar' (email)...")
+            page.get_by_role("button", name="Continuar").click()
+
+            logger.info(f"[{thread_name}] Rellenando datos personales...")
+            page.locator("#firstName").fill(datos["nombre"])
+            page.locator("#lastName").fill(datos["apellido"])
+            page.locator("#phoneNumber").fill(datos["telefono"])
+            
+            logger.info(f"[{thread_name}] Haciendo clic en 'Continuar' (datos)...")
+            page.get_by_role("button", name="Continuar").click()
+            
+            logger.info(f"[{thread_name}] Rellenando contraseña...")
+            page.locator("#password").fill(datos["password"])
+            page.locator("#confirmPassword").fill(datos["password"])
+            
+            logger.info(f"[{thread_name}] Haciendo clic en 'Finalizar registro'...")
+            page.get_by_role("button", name="Finalizar registro").click()
+
+            # --- LÓGICA DE VERIFICACIÓN OTP ---
+            logger.info(f"[{thread_name}] Volviendo a la pestaña de email para buscar el código...")
+            page_tempmail.bring_to_front()
+
+            logger.info(f"[{thread_name}] Esperando el email de 'Código de verificación'...")
+            email_found = False
+            for i in range(3): 
+                try:
+                    email_subject_locator = page_tempmail.get_by_text("Código de verificación")
+                    expect(email_subject_locator.first).to_be_visible(timeout=5000) 
+                    email_subject_locator.locator("xpath=..").first.click() 
+                    logger.info(f"[{thread_name}] Email de verificación encontrado y abierto.")
+                    email_found = True
+                    break 
+                except Exception:
+                    logger.warning(f"[{thread_name}] Intento {i+1}/3 fallido. Recargando la página de email...")
+                    page_tempmail.reload()
+                    try:
+                        email_input_element = page_tempmail.locator("#Dont_use_WEB_use_API_OK")
+                        expect(email_input_element).not_to_have_value("...", timeout=10000)
+                    except Exception as reload_e:
+                        logger.error(f"[{thread_name}] Error fatal al recargar la página de email: {reload_e}")
+                        raise reload_e
+
+            if not email_found:
+                raise Exception("No se pudo encontrar el email de verificación después de 3 intentos.")
+
+            logger.info(f"[{thread_name}] Buscando el iframe del cuerpo del mensaje...")
+            iframe_selector = 'iframe[id="iFrameResizer0"]'
+            iframe_locator = page_tempmail.frame_locator(iframe_selector)
+            css_selector = 'span[style*="font-size:26px"][style*="font-weight:700"]'
+            code_locator = iframe_locator.locator(css_selector)
+            
+            expect(code_locator).to_be_visible(timeout=10000) 
+            codigo = code_locator.text_content().strip() 
+            
+            if not (len(codigo) == 6 and codigo.isdigit()):
+                 raise Exception(f"El código extraído no es válido: {codigo}")
+            
+            logger.info(f"[{thread_name}] Código OTP obtenido: {codigo}")
+            page_tempmail.close()
+
+            logger.info(f"[{thread_name}] Volviendo a la pestaña de registro...")
+            page.bring_to_front()
+
+            logger.info(f"[{thread_name}] Ingresando el código OTP...")
+            for i in range(6):
+                page.locator(f"#otp-input-{i}").fill(codigo[i])
+            
+            continuar_otp_button = page.get_by_role("button", name="Continuar")
+            expect(continuar_otp_button).to_be_enabled(timeout=10000)
+            
+            logger.info(f"[{thread_name}] Haciendo clic en 'Continuar' (OTP)...")
+            continuar_otp_button.click()
+            logger.info(f"[{thread_name}] Proceso de verificación completado.")
+            time.sleep(1) 
+
+            # --- INICIO DE SECUENCIA DE VOTOS POST-REGISTRO ---
+            logger.info(f"[{thread_name}] Iniciando secuencia de votos post-registro...")
+            
+            # 25. Voto 1/2
+            logger.info(f"[{thread_name}] Voto 1/2: Esperando 1 segundo...")
+            time.sleep(1)
+            page.goto(url)
+            page.get_by_label("Votar").click()
+            page.get_by_role("button", name="Confirmar").click()
+            logger.info(f"[{thread_name}] ¡Voto 1/2 emitido!")
+            votes_in_this_cycle = 1 # <--- (NUEVO) Conteo de votos
+
+            # 26. Voto 2/2
+            logger.info(f"[{thread_name}] Voto 2/2: Esperando 1 segundo...")
+            time.sleep(1)
+            page.goto(url)
+            page.get_by_label("Votar").click()
+            page.get_by_role("button", name="Confirmar").click()
+            logger.info(f"[{thread_name}] ¡Voto 2/2 emitido!")
+            votes_in_this_cycle = 2 # <--- (NUEVO) Conteo de votos
+            
+            # --- (NUEVO) Si llega aquí, el ciclo fue exitoso ---
+            cycle_succeeded = True
+
+        except Exception as e:
+            # <--- (MODIFICADO) Usar logger.error ---
+            logger.error(f"[{thread_name}] Ocurrió un error en este ciclo: {e}", exc_info=True)
+            # Guardar capturas de pantalla si hay un error
+
+
+        finally:
+            if browser:
+                browser.close()
+            
+            # --- (NUEVO) Lógica de conteo al final del ciclo ---
+            global total_cycles_ok, total_cycles_fail, total_votes_ok
+            
+            # Usar el lock para actualizar los contadores globales
+            with counter_lock:
+                if cycle_succeeded:
+                    logger.info(f"[{thread_name}] --- CICLO EXITOSO. {votes_in_this_cycle} votos emitidos. ---")
+                    total_cycles_ok += 1
+                    total_votes_ok += votes_in_this_cycle
+                else:
+                    logger.warning(f"[{thread_name}] --- CICLO FALLIDO. 0 votos emitidos. ---")
+                    total_cycles_fail += 1
+
+            # Pausa breve antes de que el hilo termine
+            time.sleep(random.randint(3, 8))
+
+
+# --- (MODIFICADO) BUCLE PRINCIPAL "ORQUESTADOR" con logging ---
 if __name__ == "__main__":
-    # asyncio.run() se encarga de iniciar y cerrar el bucle de eventos
-    asyncio.run(main())
+    # 1. Configurar el logging ANTES de crear hilos
+    setup_logging()
+    logger = logging.getLogger(__name__)
 
+    logger.info(f"--- Iniciando Orquestador con {NUM_WORKERS} workers paralelos ---")
+    logger.info("--- Los logs se guardarán en 'bot_log.txt' ---")
+    logger.info("--- Presiona Ctrl+C para detener el script ---")
+    
+    active_threads = []
+    
+    try:
+        last_stats_report = time.time()
+        
+        while True:
+            # 1. Limpiar hilos que ya terminaron
+            active_threads = [t for t in active_threads if t.is_alive()]
+            
+            # 2. Si hay espacio, crear nuevos hilos
+            while len(active_threads) < NUM_WORKERS:
+                thread_name = f"Worker-{random.randint(100, 999)}"
+                logger.info(f"[Orquestador] Capacidad: {len(active_threads)}/{NUM_WORKERS}. Iniciando {thread_name}...")
+                
+                thread = threading.Thread(target=run, name=thread_name)
+                thread.daemon = True 
+                thread.start()
+                active_threads.append(thread)
+                time.sleep(random.uniform(1.0, 3.0)) 
+            
+            # 3. (NUEVO) Reportar estadísticas cada 10 segundos
+            current_time = time.time()
+            if current_time - last_stats_report > 10:
+                with counter_lock:
+                    logger.info("="*60)
+                    logger.info(f"[ESTADÍSTICAS] Ciclos OK: {total_cycles_ok} | Ciclos Fallidos: {total_cycles_fail} | Votos Totales: {total_votes_ok}")
+                    logger.info("="*60)
+                last_stats_report = current_time
 
+            time.sleep(1) 
+
+    except KeyboardInterrupt:
+        logger.info("\n--- Interrupción de teclado detectada. Saliendo... ---")
